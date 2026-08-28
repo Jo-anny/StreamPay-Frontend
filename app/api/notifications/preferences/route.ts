@@ -10,6 +10,7 @@ import { getCorrelationContext, logger } from "@/app/lib/logger";
 import { checkRateLimit, getClientIdentity, rateLimitResponse } from "@/app/lib/rate-limit";
 import { getLimitForRoute } from "@/app/lib/rate-limit-config";
 import { recordRequest, recordThrottle } from "@/app/lib/rate-limit-metrics";
+import { computeETag, ifNoneMatchMatches } from "@/app/lib/etag";
 
 interface NotificationPreferences {
   userId: string;
@@ -153,12 +154,19 @@ export async function GET(request: Request) {
   }
 
   const preferences = getPreferences(actor.actorId);
+  const etag = computeETag(actor.actorId, preferences);
+
   logger.info("Notification preferences fetched", {
     actorId: actor.actorId,
     walletAddress: actor.walletAddress,
   });
 
-  return NextResponse.json({ preferences });
+  return NextResponse.json({ preferences }, {
+    headers: {
+      ETag: etag,
+      "Cache-Control": "private, max-age=0, must-revalidate",
+    },
+  });
 }
 
 export async function PUT(request: Request) {
@@ -200,6 +208,23 @@ export async function PUT(request: Request) {
   }
 
   const existing = getPreferences(actor.actorId);
+  const currentEtag = computeETag(actor.actorId, existing);
+  const ifMatch = request.headers.get("if-match");
+
+  if (ifMatch && !ifNoneMatchMatches(ifMatch, currentEtag)) {
+    logger.warn("Notification preferences update conflict detected", {
+      actorId: actor.actorId,
+      ifMatch,
+      currentEtag,
+    });
+    return createErrorResponse(
+      request,
+      "STATE_CONFLICT",
+      "Notification preferences have been modified concurrently. Please reload and retry.",
+      409,
+    );
+  }
+
   const updated: NotificationPreferences = {
     ...existing,
     ...payload,
@@ -211,10 +236,17 @@ export async function PUT(request: Request) {
   };
 
   prefsStore.set(actor.actorId, updated);
+  const newEtag = computeETag(actor.actorId, updated);
+
   logger.info("Notification preferences updated", {
     actorId: actor.actorId,
     updatedFields: Object.keys(payload),
   });
 
-  return NextResponse.json({ preferences: updated });
+  return NextResponse.json({ preferences: updated }, {
+    headers: {
+      ETag: newEtag,
+      "Cache-Control": "private, max-age=0, must-revalidate",
+    },
+  });
 }
